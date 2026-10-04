@@ -43,9 +43,10 @@ adb install -r dist/tailscale-fireos5-*.apk
 
 | | |
 |---|---|
-| [docs/STATUS.md](docs/STATUS.md) | what works, the seven patches, verification method, gotchas |
+| [docs/STATUS.md](docs/STATUS.md) | what works, patches, verification method, gotchas |
 | [docs/BUILD.md](docs/BUILD.md) | prerequisites, build, troubleshooting, reproducibility |
 | [docs/DEVICES.md](docs/DEVICES.md) | which hardware this is for — every Fire TV and Fire tablet model, plus non-Amazon devices |
+| [docs/NETWORK_RECOVERY.md](docs/NETWORK_RECOVERY.md) | initial network detection, route changes, and recovery tests |
 | [docs/BACKGROUND.md](docs/BACKGROUND.md) | why the gap exists, why 1.98.8 |
 | [docs/FINDINGS.md](docs/FINDINGS.md) | investigation record, including disproven theories |
 

@@ -1,9 +1,9 @@
 # Status — WORKING
 
-Last updated 2026-07-26.
+Last updated 2026-10-04.
 
 Tailscale **1.98.8** (current stable) runs on **Fire OS 5 / Android 5.1 / API 22** with
-seven patches, and **routes traffic through an exit node**.
+compatibility patches, and **routes traffic through an exit node**.
 
 ---
 
@@ -62,7 +62,7 @@ TS_REF=1.98.8-t1241b225b-gbcbaf1889 MIN_SDK=22 ./scripts/build.sh
 ~12 s incremental, a few minutes cold. Patches apply automatically; the build hard-fails
 if any does not.
 
-## The seven patches
+## Patches
 
 | # | Fixes | API |
 |---|---|---|
@@ -73,10 +73,12 @@ if any does not.
 | 0005 | netmap decode: `decodeFromString`, not `decodeFromStream` | ≤23 |
 | 0006 | drop `setExpedited` from `IPNReceiver` work requests | 31 |
 | 0007 | `coreLibraryDesugaring` for `java.time` | 26 |
+| 0009 | Initial network snapshot, DNS/route recovery, ordered latest-state delivery, API-21 VPN detection | 22+; initial snapshot below 26 |
 
-Upstream runs at minSdk 26, so guards that became dead code were dropped over time. All of
-these are that, **except 0005** — not a missing guard, but a platform bug Google fixed at
-API 24.
+Upstream runs at minSdk 26, so guards that became dead code were dropped over time. The
+original patches address missing guards, **except 0005**, which works around a platform
+bug Google fixed at API 24. Additional patches address runtime compatibility and
+recovery gaps on older Android releases.
 
 ### 0005 is the interesting one
 
@@ -105,12 +107,16 @@ pins 1.6.3.
 
 ### 0004 — the connectivity fix
 
-`bindSocketToNetwork()` failed two ways on API 22: the `NetworkRequest` callback never
-fires (`cachedDefaultNetwork` permanently null), and `Network.bindSocket(FileDescriptor)`
-is API 23 regardless — a `NoSuchMethodError`, which the surrounding `catch (Exception)`
-would not have caught. Fixed with `VpnService.protect(fd)` (API 14), the platform's own
-mechanism for keeping a VPN app's sockets outside its tunnel. Upstream never needs it
-because `bindSocket` is strictly better at API 23+.
+On API 22, the initial `onAvailable` callback may arrive without the capabilities or
+link-properties callbacks expected by upstream. That left `cachedDefaultNetwork` null.
+Patch 0009 reads the initial snapshot on API <26 and keeps DNS and route notifications
+up to date; see [network recovery](NETWORK_RECOVERY.md).
+
+`Network.bindSocket(FileDescriptor)` is API 23 regardless — a `NoSuchMethodError`, which
+the surrounding `catch (Exception)` would not have caught. Patch 0004 uses
+`VpnService.protect(fd)` (API 14), the platform's mechanism for keeping a VPN app's
+sockets outside its tunnel. This fallback is still needed even with initial network
+detection fixed.
 
 ## Setting an exit node
 
@@ -216,6 +222,6 @@ Fire TV Stick 2nd gen — `AFTT` / `tank`, retail **LY73PR**, Fire OS 5.2.9.5, A
 
 Everything needed works. Optional polish:
 
-1. `NetworkChangeCallback` never fires on API 22, so `protect()` pins to nothing. Equivalent
-   on a single-uplink device; would matter on multi-uplink.
+1. Verify the network recovery patch on Fire OS and additional physical devices,
+   including devices with multiple uplinks.
 2. Launch is slow, 5-7 s to first frame, on this hardware.

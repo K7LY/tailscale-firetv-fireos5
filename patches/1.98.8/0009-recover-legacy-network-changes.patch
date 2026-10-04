@@ -1,0 +1,544 @@
+diff --git a/android/build.gradle b/android/build.gradle
+index 0cda8e4..c2e21c6 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -108,6 +108,10 @@ android {
+         }
+     }
+ 
++    testOptions {
++        unitTests.includeAndroidResources = true
++    }
++
+     testBuildType "applicationTest"
+ }
+ 
+@@ -173,6 +177,7 @@ dependencies {
+ 
+     // Unit Tests
+     testImplementation 'junit:junit:4.13.2'
++    testImplementation 'org.robolectric:robolectric:4.12.2'
+     testImplementation 'org.mockito:mockito-core:5.12.0'
+     testImplementation 'org.mockito:mockito-inline:5.2.0'
+     testImplementation 'org.mockito.kotlin:mockito-kotlin:5.4.0'
+diff --git a/android/src/main/java/com/tailscale/ipn/NetworkChangeCallback.kt b/android/src/main/java/com/tailscale/ipn/NetworkChangeCallback.kt
+index 2919e4d..2f83cb9 100644
+--- a/android/src/main/java/com/tailscale/ipn/NetworkChangeCallback.kt
++++ b/android/src/main/java/com/tailscale/ipn/NetworkChangeCallback.kt
+@@ -7,6 +7,7 @@ import android.net.LinkProperties
+ import android.net.Network
+ import android.net.NetworkCapabilities
+ import android.net.NetworkRequest
++import android.os.Build
+ import android.util.Log
+ import com.tailscale.ipn.util.TSLog
+ import java.util.concurrent.locks.ReentrantLock
+@@ -40,7 +41,12 @@ object NetworkChangeCallback {
+   // monitorDnsChanges sets up a network callback to monitor changes to the
+   // system's network state and update the DNS configuration when interfaces
+   // become available or properties of those interfaces change.
+-  fun monitorDnsChanges(connectivityManager: ConnectivityManager, dns: DnsConfig) {
++  fun monitorDnsChanges(
++      connectivityManager: ConnectivityManager,
++      dns: DnsConfig,
++      // Also wakes native netmon after route changes, even if DNS is unchanged.
++      notifyNetworkChange: (String) -> Unit = { Libtailscale.onDNSConfigChanged(it) }
++  ) {
+     val networkConnectivityRequest =
+         NetworkRequest.Builder()
+             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+@@ -65,29 +71,56 @@ object NetworkChangeCallback {
+ 
+             TSLog.d(TAG, "onAvailable: network $network")
+ 
+-            lock.withLock {
+-              activeNetworks[network] = NetworkInfo(NetworkCapabilities(), LinkProperties())
++            val interfaceName = lock.withLock {
++              // Before API 26, AVAILABLE may be the only initial callback. Fetch
++              // its snapshot here; newer Android delivers the properties next.
++              activeNetworks[network] =
++                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
++                    NetworkInfo(
++                        connectivityManager.getNetworkCapabilities(network) ?: NetworkCapabilities(),
++                        connectivityManager.getLinkProperties(network) ?: LinkProperties())
++                  } else {
++                    NetworkInfo(NetworkCapabilities(), LinkProperties())
++                  }
+               recomputeDefaultNetworkLocked("onAvailable")
++              if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
++                maybeUpdateDNSConfig("onAvailable", dns)
++                cachedDefaultInterfaceName.orEmpty()
++              } else {
++                // Wait for the ordered capabilities/link-properties callbacks.
++                null
++              }
+             }
++            interfaceName?.let(notifyNetworkChange)
+           }
+ 
+           override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+             super.onCapabilitiesChanged(network, capabilities)
+ 
+-            lock.withLock {
++            val interfaceName = lock.withLock {
+               activeNetworks[network]?.caps = capabilities
+               recomputeDefaultNetworkLocked("onCapabilitiesChanged")
++              if (activeNetworks[network]?.linkProps?.interfaceName == null &&
++                  cachedDefaultInterfaceName == null) {
++                null // The initial link-properties callback has not arrived yet.
++              } else {
++                maybeUpdateDNSConfig("onCapabilitiesChanged", dns)
++                cachedDefaultInterfaceName.orEmpty()
++              }
+             }
++            interfaceName?.let(notifyNetworkChange)
+           }
+ 
+           override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+             super.onLinkPropertiesChanged(network, linkProperties)
+ 
+-            lock.withLock {
++            val interfaceName = lock.withLock {
+               activeNetworks[network]?.linkProps = linkProperties
+               recomputeDefaultNetworkLocked("onLinkPropertiesChanged")
+               maybeUpdateDNSConfig("onLinkPropertiesChanged", dns)
++              cachedDefaultInterfaceName.orEmpty()
+             }
++            notifyNetworkChange(interfaceName)
+           }
+ 
+           override fun onLost(network: Network) {
+@@ -95,11 +128,13 @@ object NetworkChangeCallback {
+ 
+             TSLog.d(TAG, "onLost: network $network")
+ 
+-            lock.withLock {
++            val interfaceName = lock.withLock {
+               activeNetworks.remove(network)
+               recomputeDefaultNetworkLocked("onLost")
+               maybeUpdateDNSConfig("onLost", dns)
++              cachedDefaultInterfaceName.orEmpty()
+             }
++            notifyNetworkChange(interfaceName)
+           }
+         })
+   }
+@@ -172,15 +207,10 @@ object NetworkChangeCallback {
+   // maybeUpdateDNSConfig will maybe update our DNS configuration based on the
+   // current set of active Networks.
+   private fun maybeUpdateDNSConfig(why: String, dns: DnsConfig) {
+-    val defaultNetwork = cachedDefaultNetwork
+-    if (defaultNetwork == null) {
+-      TSLog.d(TAG, "$why: no default network available; not updating DNS")
+-      return
+-    }
+-
+     val info = cachedDefaultNetworkInfo
+     if (info == null) {
+-      Log.w(TAG, "$why: no info for default network; not updating DNS")
++      dns.updateDNSFromNetwork("")
++      TSLog.d(TAG, "$why: no default network available; cleared DNS")
+       return
+     }
+ 
+@@ -197,7 +227,6 @@ object NetworkChangeCallback {
+ 
+     if (dns.updateDNSFromNetwork(sb.toString())) {
+       TSLog.d(TAG, "$why: updated DNS config for iface=${info.linkProps.interfaceName}")
+-      Libtailscale.onDNSConfigChanged(info.linkProps.interfaceName)
+     }
+   }
+ }
+diff --git a/android/src/test/kotlin/com/tailscale/ipn/NetworkChangeCallbackTest.kt b/android/src/test/kotlin/com/tailscale/ipn/NetworkChangeCallbackTest.kt
+new file mode 100644
+index 0000000..27b9530
+--- /dev/null
++++ b/android/src/test/kotlin/com/tailscale/ipn/NetworkChangeCallbackTest.kt
+@@ -0,0 +1,148 @@
++package com.tailscale.ipn
++
++import android.app.Application
++import android.net.ConnectivityManager
++import android.net.LinkProperties
++import android.net.Network
++import android.net.NetworkCapabilities
++import android.net.NetworkRequest
++import com.tailscale.ipn.util.TSLog
++import java.net.InetAddress
++import org.junit.Assert.*
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mockito.Mockito.*
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [22], application = Application::class)
++class NetworkChangeCallbackTest {
++  private lateinit var manager: ConnectivityManager
++  private lateinit var callback: ConnectivityManager.NetworkCallback
++  private lateinit var dns: DnsConfig
++  private val notifications = mutableListOf<String>()
++
++  @Before
++  fun setUp() {
++    // The monitor owns process-wide state; isolate tests without adding a production reset API.
++    val networks = NetworkChangeCallback::class.java.getDeclaredField("activeNetworks")
++    networks.isAccessible = true
++    (networks.get(NetworkChangeCallback) as MutableMap<*, *>).clear()
++    TSLog.libtailscaleWrapper = mock(TSLog.LibtailscaleWrapper::class.java)
++    manager = mock(ConnectivityManager::class.java)
++    dns = DnsConfig()
++    notifications.clear()
++    doAnswer { invocation ->
++      callback = invocation.getArgument(1)
++      null
++    }.`when`(manager).registerNetworkCallback(
++        any(NetworkRequest::class.java), any(ConnectivityManager.NetworkCallback::class.java))
++    NetworkChangeCallback.monitorDnsChanges(manager, dns) { notifications.add(it) }
++  }
++
++  private fun capabilities() = mock(NetworkCapabilities::class.java).also {
++    `when`(it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)).thenReturn(true)
++    `when`(it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)).thenReturn(true)
++  }
++
++  private fun properties(iface: String = "wlan0") = mock(LinkProperties::class.java).also {
++    `when`(it.interfaceName).thenReturn(iface)
++    `when`(it.dnsServers).thenReturn(listOf(InetAddress.getByName("192.0.2.53")))
++    `when`(it.domains).thenReturn("example.test")
++  }
++
++  private fun network(): Network {
++    val network = mock(Network::class.java)
++    val caps = capabilities()
++    val props = properties()
++    `when`(manager.getNetworkCapabilities(network)).thenReturn(caps)
++    `when`(manager.getLinkProperties(network)).thenReturn(props)
++    return network
++  }
++
++  private fun connect(network: Network) {
++    callback.onAvailable(network)
++    callback.onCapabilitiesChanged(network, capabilities())
++    callback.onLinkPropertiesChanged(network, properties())
++  }
++
++  @Test
++  fun api22AvailableAloneSelectsNetworkAndPublishesDnsAndRoute() {
++    val network = network()
++    callback.onAvailable(network)
++    assertSame(network, NetworkChangeCallback.cachedDefaultNetwork)
++    assertEquals("wlan0", NetworkChangeCallback.cachedDefaultInterfaceName)
++    assertEquals("192.0.2.53 \nexample.test", dns.dnsConfigAsString)
++    assertEquals(listOf("wlan0"), notifications)
++  }
++
++  @Test
++  @Config(sdk = [28])
++  fun modernInitialCallbacksPublishOnlyCompleteRoute() {
++    val network = network()
++    dns.updateDNSFromNetwork("previous DNS")
++    callback.onAvailable(network)
++    assertEquals("previous DNS", dns.dnsConfigAsString)
++    assertTrue(notifications.isEmpty())
++    callback.onCapabilitiesChanged(network, capabilities())
++    assertEquals("previous DNS", dns.dnsConfigAsString)
++    assertTrue(notifications.isEmpty())
++    callback.onLinkPropertiesChanged(network, properties())
++    assertEquals(listOf("wlan0"), notifications)
++    assertEquals("192.0.2.53 \nexample.test", dns.dnsConfigAsString)
++  }
++
++  @Test
++  fun reconnectWithUnchangedDnsStillPublishesRoute() {
++    val first = network()
++    connect(first)
++    val replacement = network()
++    callback.onAvailable(replacement)
++    callback.onCapabilitiesChanged(replacement, capabilities())
++    callback.onLinkPropertiesChanged(replacement, properties())
++    notifications.clear()
++    callback.onLost(first)
++    assertSame(replacement, NetworkChangeCallback.cachedDefaultNetwork)
++    assertEquals("192.0.2.53 \nexample.test", dns.dnsConfigAsString)
++    assertEquals(listOf("wlan0"), notifications)
++  }
++
++  @Test
++  fun unchangedLinkPropertiesStillPublishRoute() {
++    val network = network()
++    connect(network)
++    notifications.clear()
++    callback.onLinkPropertiesChanged(network, properties())
++    assertEquals("192.0.2.53 \nexample.test", dns.dnsConfigAsString)
++    assertEquals(listOf("wlan0"), notifications)
++  }
++
++  @Test
++  fun losingLastNetworkClearsDnsAndPublishesNoRoute() {
++    val network = network()
++    connect(network)
++    notifications.clear()
++    callback.onLost(network)
++    assertNull(NetworkChangeCallback.cachedDefaultNetwork)
++    assertNull(NetworkChangeCallback.cachedDefaultInterfaceName)
++    assertEquals("", dns.dnsConfigAsString)
++    assertEquals(listOf(""), notifications)
++  }
++
++  @Test
++  fun capabilityLossAndRecoveryRefreshDnsAndRoute() {
++    val network = network()
++    connect(network)
++    notifications.clear()
++    callback.onCapabilitiesChanged(network, NetworkCapabilities())
++    assertNull(NetworkChangeCallback.cachedDefaultNetwork)
++    assertEquals("", dns.dnsConfigAsString)
++    assertEquals(listOf(""), notifications)
++    callback.onCapabilitiesChanged(network, capabilities())
++    assertSame(network, NetworkChangeCallback.cachedDefaultNetwork)
++    assertEquals("192.0.2.53 \nexample.test", dns.dnsConfigAsString)
++    assertEquals(listOf("", "wlan0"), notifications)
++  }
++}
+diff --git a/libtailscale/backend.go b/libtailscale/backend.go
+index 7e01a16..8e8d521 100644
+--- a/libtailscale/backend.go
++++ b/libtailscale/backend.go
+@@ -277,7 +277,7 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
+ 			// regenerating the DNS config but have the means to do
+ 			// that independently of userspace engine network changes which may
+ 			// eliminate some unnecessary work.
+-			go b.NetworkChanged(i)
++			b.NetworkChanged(i)
+ 		}
+ 	}
+ }
+diff --git a/libtailscale/callbacks.go b/libtailscale/callbacks.go
+index 9daec5c..5651094 100644
+--- a/libtailscale/callbacks.go
++++ b/libtailscale/callbacks.go
+@@ -19,7 +19,8 @@ var (
+ 	onGoogleToken = make(chan string)
+ 
+ 	// onDNSConfigChanged is notified when the network changes and the DNS config needs to be updated. It receives the updated interface name.
+-	onDNSConfigChanged = make(chan string, 1)
++	onDNSConfigChanged   = make(chan string, 1)
++	onDNSConfigChangedMu sync.Mutex
+ 
+ 	// onLog receives Android logs to be sent to the logger
+ 	onLog = make(chan string, 10)
+@@ -30,10 +31,7 @@ var (
+ 
+ // ifname is the interface name retrieved from LinkProperties on network change. An empty string is used if there is no network available.
+ func OnDNSConfigChanged(ifname string) {
+-	select {
+-	case onDNSConfigChanged <- ifname:
+-	default:
+-	}
++	queueLatestNetworkChange(onDNSConfigChanged, &onDNSConfigChangedMu, ifname)
+ }
+ 
+ var android struct {
+diff --git a/libtailscale/callbacks_test.go b/libtailscale/callbacks_test.go
+new file mode 100644
+index 0000000..eefe36a
+--- /dev/null
++++ b/libtailscale/callbacks_test.go
+@@ -0,0 +1,97 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package libtailscale
++
++import (
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++)
++
++func testNetworkChanges() (chan string, func(string)) {
++	changes := make(chan string, 1)
++	var mu sync.Mutex
++	return changes, func(iface string) { queueLatestNetworkChange(changes, &mu, iface) }
++}
++
++func TestNetworkChangeBurstKeepsLatestRoute(t *testing.T) {
++	for _, tt := range []struct {
++		name   string
++		inputs []string
++		want   string
++	}{
++		{"initial network becomes available", []string{"", "wlan0"}, "wlan0"},
++		{"network recovers on cellular", []string{"wlan0", "", "rmnet0"}, "rmnet0"},
++		{"last network disappears", []string{"wlan0", ""}, ""},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			changes, notify := testNetworkChanges()
++			for _, iface := range tt.inputs {
++				notify(iface)
++			}
++			select {
++			case got := <-changes:
++				if got != tt.want {
++					t.Fatalf("route after burst = %q; want %q", got, tt.want)
++				}
++			default:
++				t.Fatal("missing network notification")
++			}
++			select {
++			case stale := <-changes:
++				t.Fatalf("stale route remains queued: %q", stale)
++			default:
++			}
++		})
++	}
++}
++
++func TestNetworkChangeRepeatedRouteStillNotifies(t *testing.T) {
++	changes, notify := testNetworkChanges()
++	for range 3 {
++		notify("wlan0")
++		select {
++		case got := <-changes:
++			if got != "wlan0" {
++				t.Fatalf("route = %q; want wlan0", got)
++			}
++		default:
++			t.Fatal("unchanged route did not notify")
++		}
++	}
++}
++
++func TestNetworkChangeConcurrentWritersKeepFinalRoute(t *testing.T) {
++	changes, notify := testNetworkChanges()
++	var writers sync.WaitGroup
++	for writer := range 16 {
++		writers.Add(1)
++		go func() {
++			defer writers.Done()
++			for update := range 100 {
++				notify(fmt.Sprintf("iface-%d-%d", writer, update))
++			}
++		}()
++	}
++	done := make(chan struct{})
++	go func() {
++		writers.Wait()
++		notify("rmnet0")
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("network change writers blocked without a consumer")
++	}
++	select {
++	case got := <-changes:
++		if got != "rmnet0" {
++			t.Fatalf("final route = %q; want rmnet0", got)
++		}
++	default:
++		t.Fatal("missing final route notification")
++	}
++}
+diff --git a/libtailscale/network_change_queue.go b/libtailscale/network_change_queue.go
+new file mode 100644
+index 0000000..eeb07a5
+--- /dev/null
++++ b/libtailscale/network_change_queue.go
+@@ -0,0 +1,24 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package libtailscale
++
++import "sync"
++
++// queueLatestNetworkChange replaces a pending route in a one-element channel.
++// Serialize senders so the newest route cannot be dropped or block on enqueue.
++func queueLatestNetworkChange(changes chan string, mu *sync.Mutex, ifname string) {
++	mu.Lock()
++	defer mu.Unlock()
++
++	select {
++	case changes <- ifname:
++	default:
++		// The receiver may already have consumed the pending route.
++		select {
++		case <-changes:
++		default:
++		}
++		changes <- ifname
++	}
++}
+diff --git a/android/src/main/java/com/tailscale/ipn/MainActivity.kt b/android/src/main/java/com/tailscale/ipn/MainActivity.kt
+index 7b7181e..34443f0 100644
+--- a/android/src/main/java/com/tailscale/ipn/MainActivity.kt
++++ b/android/src/main/java/com/tailscale/ipn/MainActivity.kt
+@@ -451,16 +451,14 @@ class MainActivity : ComponentActivity() {
+   fun isAnotherVpnActive(context: Context): Boolean {
+     val connectivityManager =
+         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+-    val activeNetwork = connectivityManager.activeNetwork
+-    if (activeNetwork != null) {
+-      val networkCapabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
+-      if (networkCapabilities != null &&
+-          networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+-        return true
+-      }
++    // allNetworks and getNetworkCapabilities are available from API 21.
++    // getActiveNetwork is only available from API 23.
++    return connectivityManager.allNetworks.any { network ->
++      connectivityManager.getNetworkCapabilities(network)
++          ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+     }
+-    return false
+   }
++
+   // Returns true if we should render a QR code instead of launching a browser
+   // for login requests
+   private fun useQRCodeLogin(): Boolean {
+diff --git a/android/src/test/kotlin/com/tailscale/ipn/VpnNetworkDetectionTest.kt b/android/src/test/kotlin/com/tailscale/ipn/VpnNetworkDetectionTest.kt
+new file mode 100644
+index 0000000..1ebc587
+--- /dev/null
++++ b/android/src/test/kotlin/com/tailscale/ipn/VpnNetworkDetectionTest.kt
+@@ -0,0 +1,34 @@
++package com.tailscale.ipn
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.net.Network
++import android.net.NetworkCapabilities
++import org.junit.Assert.*
++import org.junit.Test
++import org.mockito.Mockito.*
++
++class VpnNetworkDetectionTest {
++  @Test fun detectsVpnOnLegacyAndroidWithoutDefaultNetworkApi() {
++    val context = mock(Context::class.java)
++    val manager = mock(ConnectivityManager::class.java)
++    val network = mock(Network::class.java)
++    val caps = mock(NetworkCapabilities::class.java)
++    `when`(context.getSystemService(Context.CONNECTIVITY_SERVICE)).thenReturn(manager)
++    `when`(manager.allNetworks).thenReturn(arrayOf(network))
++    `when`(manager.getNetworkCapabilities(network)).thenReturn(caps)
++    `when`(caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)).thenReturn(true)
++    val activity = mock(MainActivity::class.java, CALLS_REAL_METHODS)
++    assertTrue(activity.isAnotherVpnActive(context))
++    verify(manager, never()).activeNetwork
++  }
++  @Test fun absentNetworkCapabilitiesAreNotAVpn() {
++    val context = mock(Context::class.java)
++    val manager = mock(ConnectivityManager::class.java)
++    val network = mock(Network::class.java)
++    `when`(context.getSystemService(Context.CONNECTIVITY_SERVICE)).thenReturn(manager)
++    `when`(manager.allNetworks).thenReturn(arrayOf(network))
++    val activity = mock(MainActivity::class.java, CALLS_REAL_METHODS)
++    assertFalse(activity.isAnotherVpnActive(context))
++  }
++}
